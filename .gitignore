@@ -1,0 +1,37 @@
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local execution/runtime state
+.codex
+.jupyter/
+.rmats_run/
+*.log
+*.out
+*.err
+slurm-*.out
+
+# Extracted notebook figures; executed notebooks embed their own outputs.
+notebook_figures/
+notebook_figures_v2/
+notebook_figures_executed/
+
+# Large generated analysis/data products
+*.h5ad
+*.npz
+*.bam
+*.bai
+*.sam
+*.fastq
+*.fq
+*.gz
+rmats_testing/
+rmats_output/
+final_data/
+
+# Local virtual environments and scratch
+.venv/
+venv/
+tmp/
+scratch/
