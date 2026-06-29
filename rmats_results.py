@@ -208,6 +208,7 @@ def process_sample(
     sample_label: str,
     event_types: Iterable[str],
     use_jcec: bool,
+    skip_existing: bool = False,
 ) -> int:
     sample_dir = os.path.join(main_dir, "rmats", sample_name)
     zip_path = os.path.join(sample_dir, "output_archive.zip")
@@ -217,14 +218,18 @@ def process_sample(
         print(f"\t⚠️ Missing rMATS archive for {sample_name}")
         return 1
 
+    os.makedirs(psi_dir, exist_ok=True)
+    csv_name = os.path.join(psi_dir, f"{sample_name}.csv")
+    if skip_existing and os.path.exists(csv_name):
+        print(f"\t↪️ Skipping existing {csv_name}")
+        return 0
+
     tables = []
     for event_type in event_types:
         rmats_df = read_rmats_table(sample_dir, event_type, use_jcec)
         tables.append(extract_psi_table(rmats_df, sample_label, event_type))
 
     out_df = pd.concat(tables, ignore_index=True)
-    os.makedirs(psi_dir, exist_ok=True)
-    csv_name = os.path.join(psi_dir, f"{sample_name}.csv")
     out_df.to_csv(csv_name, index=False)
     if os.path.exists(csv_name):
         print(f"\t✅ Successfully saved {csv_name} ({len(out_df):,} events)")
@@ -233,10 +238,10 @@ def process_sample(
     return 1
 
 
-def process_cell_task(task: Tuple[str, str, str, str, str, Tuple[str, ...], bool]) -> int:
-    sample_name, main_dir, psi_dir, sample_label, cell_id, event_types, use_jcec = task
+def process_cell_task(task: Tuple[str, str, str, str, str, Tuple[str, ...], bool, bool]) -> int:
+    sample_name, main_dir, psi_dir, sample_label, cell_id, event_types, use_jcec, skip_existing = task
     print(f"🔷 Processing {cell_id}...")
-    return process_sample(sample_name, main_dir, psi_dir, sample_label, event_types, use_jcec)
+    return process_sample(sample_name, main_dir, psi_dir, sample_label, event_types, use_jcec, skip_existing)
 
 
 def main():
@@ -251,6 +256,7 @@ def main():
     parser.add_argument("--event-types", default="all", help="Comma-separated event types to extract, or 'all'")
     parser.add_argument("--count-type", choices=["JCEC", "JC"], default="JCEC", help="rMATS count table type to use")
     parser.add_argument("--psi-dir", help="Output directory for per-cell PSI CSVs")
+    parser.add_argument("--skip-existing", action="store_true", help="Do not regenerate per-cell CSVs that already exist")
     args = parser.parse_args()
 
     main_dir = args.main_dir
@@ -276,6 +282,7 @@ def main():
                 row["cell_id"],
                 event_types,
                 use_jcec,
+                args.skip_existing,
             )
             for _, row in manifest.iterrows()
         ]
@@ -302,7 +309,15 @@ def main():
 
     sample_name = safe_name(args.cell_type)
     psi_dir = args.psi_dir or os.path.join(main_dir, "psi_data")
-    exit_code = process_sample(sample_name, main_dir, psi_dir, args.cell_type, event_types, use_jcec)
+    exit_code = process_sample(
+        sample_name,
+        main_dir,
+        psi_dir,
+        args.cell_type,
+        event_types,
+        use_jcec,
+        args.skip_existing,
+    )
     if exit_code == 0:
         print(f"\nSuccessfully saved 1 file")
 
