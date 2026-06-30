@@ -201,6 +201,22 @@ def read_rmats_table(sample_dir: str, event_type: str, use_jcec: bool) -> pd.Dat
     raise FileNotFoundError(f"Missing rMATS table: {zip_path}:{relative_path} or {output_path}")
 
 
+def output_path_for_sample(psi_dir: str, sample_name: str, output_format: str) -> str:
+    extension = "parquet" if output_format == "parquet" else "csv"
+    return os.path.join(psi_dir, f"{sample_name}.{extension}")
+
+
+def write_event_table(df: pd.DataFrame, output_path: str, output_format: str) -> None:
+    tmp_name = f"{output_path}.tmp.{os.getpid()}"
+    if output_format == "parquet":
+        df.to_parquet(tmp_name, index=False)
+    elif output_format == "csv":
+        df.to_csv(tmp_name, index=False)
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}")
+    os.replace(tmp_name, output_path)
+
+
 def process_sample(
     sample_name: str,
     main_dir: str,
@@ -209,6 +225,7 @@ def process_sample(
     event_types: Iterable[str],
     use_jcec: bool,
     skip_existing: bool = False,
+    output_format: str = "csv",
 ) -> int:
     sample_dir = os.path.join(main_dir, "rmats", sample_name)
     zip_path = os.path.join(sample_dir, "output_archive.zip")
@@ -219,9 +236,9 @@ def process_sample(
         return 1
 
     os.makedirs(psi_dir, exist_ok=True)
-    csv_name = os.path.join(psi_dir, f"{sample_name}.csv")
-    if skip_existing and os.path.exists(csv_name) and os.path.getsize(csv_name) > 0:
-        print(f"\t↪️ Skipping existing {csv_name}")
+    out_name = output_path_for_sample(psi_dir, sample_name, output_format)
+    if skip_existing and os.path.exists(out_name) and os.path.getsize(out_name) > 0:
+        print(f"\t↪️ Skipping existing {out_name}")
         return 0
 
     tables = []
@@ -230,20 +247,27 @@ def process_sample(
         tables.append(extract_psi_table(rmats_df, sample_label, event_type))
 
     out_df = pd.concat(tables, ignore_index=True)
-    tmp_name = f"{csv_name}.tmp.{os.getpid()}"
-    out_df.to_csv(tmp_name, index=False)
-    os.replace(tmp_name, csv_name)
-    if os.path.exists(csv_name):
-        print(f"\t✅ Successfully saved {csv_name} ({len(out_df):,} events)")
+    write_event_table(out_df, out_name, output_format)
+    if os.path.exists(out_name):
+        print(f"\t✅ Successfully saved {out_name} ({len(out_df):,} events)")
         return 0
-    print(f"\t⚠️ Failed to save {csv_name}")
+    print(f"\t⚠️ Failed to save {out_name}")
     return 1
 
 
-def process_cell_task(task: Tuple[str, str, str, str, str, Tuple[str, ...], bool, bool]) -> int:
-    sample_name, main_dir, psi_dir, sample_label, cell_id, event_types, use_jcec, skip_existing = task
+def process_cell_task(task: Tuple[str, str, str, str, str, Tuple[str, ...], bool, bool, str]) -> int:
+    sample_name, main_dir, psi_dir, sample_label, cell_id, event_types, use_jcec, skip_existing, output_format = task
     print(f"🔷 Processing {cell_id}...")
-    return process_sample(sample_name, main_dir, psi_dir, sample_label, event_types, use_jcec, skip_existing)
+    return process_sample(
+        sample_name,
+        main_dir,
+        psi_dir,
+        sample_label,
+        event_types,
+        use_jcec,
+        skip_existing,
+        output_format,
+    )
 
 
 def main():
@@ -259,6 +283,9 @@ def main():
     parser.add_argument("--count-type", choices=["JCEC", "JC"], default="JCEC", help="rMATS count table type to use")
     parser.add_argument("--psi-dir", help="Output directory for per-cell PSI CSVs")
     parser.add_argument("--skip-existing", action="store_true", help="Do not regenerate per-cell CSVs that already exist")
+    parser.add_argument("--output-format", choices=["csv", "parquet"], default="csv", help="Per-cell output file format")
+    parser.add_argument("--shard-index", type=int, default=0, help="0-based shard index for array jobs")
+    parser.add_argument("--shard-count", type=int, default=1, help="Total number of shards for array jobs")
     args = parser.parse_args()
 
     main_dir = args.main_dir
@@ -272,6 +299,12 @@ def main():
             manifest = manifest[manifest["cell_id"].astype(str) == args.cell_id]
         else:
             manifest = manifest[manifest["safe_cell_id"].isin(completed)]
+        if args.shard_count < 1:
+            raise ValueError("--shard-count must be >= 1")
+        if not 0 <= args.shard_index < args.shard_count:
+            raise ValueError("--shard-index must satisfy 0 <= shard-index < shard-count")
+        if args.shard_count > 1:
+            manifest = manifest.iloc[args.shard_index :: args.shard_count]
         if args.limit is not None:
             manifest = manifest.head(args.limit)
 
@@ -285,6 +318,7 @@ def main():
                 event_types,
                 use_jcec,
                 args.skip_existing,
+                args.output_format,
             )
             for _, row in manifest.iterrows()
         ]
@@ -319,6 +353,7 @@ def main():
         event_types,
         use_jcec,
         args.skip_existing,
+        args.output_format,
     )
     if exit_code == 0:
         print(f"\nSuccessfully saved 1 file")

@@ -23,13 +23,28 @@ def event_key(row: pd.Series) -> str:
     return "|".join([str(row[col]) for col in MERGE_COLS])
 
 
+def find_psi_file(psi_dir: str, safe_cell_id: str, input_format: str = "auto") -> str:
+    if input_format == "auto":
+        candidates = [
+            os.path.join(psi_dir, f"{safe_cell_id}.parquet"),
+            os.path.join(psi_dir, f"{safe_cell_id}.csv"),
+        ]
+    else:
+        extension = "parquet" if input_format == "parquet" else "csv"
+        candidates = [os.path.join(psi_dir, f"{safe_cell_id}.{extension}")]
+    return next((path for path in candidates if os.path.exists(path)), candidates[0])
+
+
 def prepare_event_df(psi_file: str) -> Tuple[pd.DataFrame, pd.Series]:
     if not os.path.exists(psi_file) or os.path.getsize(psi_file) == 0:
-        raise ValueError(f"Missing or empty PSI CSV: {psi_file}")
+        raise ValueError(f"Missing or empty PSI table: {psi_file}")
     try:
-        df = pd.read_csv(psi_file)
+        if psi_file.endswith(".parquet"):
+            df = pd.read_parquet(psi_file)
+        else:
+            df = pd.read_csv(psi_file)
     except pandas.errors.EmptyDataError as exc:
-        raise ValueError(f"Empty PSI CSV: {psi_file}") from exc
+        raise ValueError(f"Empty PSI table: {psi_file}") from exc
     required_cols = {"event_id", "psi", "inclusion_count", "exclusion_count"}
     missing_cols = required_cols.difference(df.columns)
     if missing_cols:
@@ -91,19 +106,21 @@ def chunked(items: List[dict], chunk_size: int) -> List[List[dict]]:
     return [items[start : start + chunk_size] for start in range(0, len(items), chunk_size)]
 
 
-def index_chunk(task: Tuple[int, List[dict], str]) -> Tuple[int, List[dict], Dict[str, dict], int, int]:
-    chunk_id, rows, psi_dir = task
+def index_chunk(task: Tuple[int, List[dict], str, str]) -> Tuple[int, List[dict], Dict[str, dict], int, int, int, int]:
+    chunk_id, rows, psi_dir, input_format = task
     cell_rows = []
     event_meta = {}
     psi_nnz = 0
-    count_nnz = 0
+    inclusion_nnz = 0
+    exclusion_nnz = 0
+    count_observed_nnz = 0
 
     for row in rows:
         cell_row_idx = int(row["cell_index"])
         cell_id = str(row["cell_id"])
         safe_cell_id = str(row["safe_cell_id"])
         cell_type = str(row["cell_ontology_class"])
-        psi_file = os.path.join(psi_dir, f"{safe_cell_id}.csv")
+        psi_file = find_psi_file(psi_dir, safe_cell_id, input_format)
         missing_psi = not os.path.exists(psi_file)
         observed_events = 0
         if missing_psi:
@@ -113,7 +130,12 @@ def index_chunk(task: Tuple[int, List[dict], str]) -> Tuple[int, List[dict], Dic
             observed_events = len(df)
             psi_nnz += int(df["psi"].notna().sum())
             count_mask = df["inclusion_count"].notna() & df["exclusion_count"].notna()
-            count_nnz += int(count_mask.sum())
+            inc_nonzero = count_mask & (df["inclusion_count"] > 0)
+            exc_nonzero = count_mask & (df["exclusion_count"] > 0)
+            any_nonzero = inc_nonzero | exc_nonzero
+            inclusion_nnz += int(inc_nonzero.sum())
+            exclusion_nnz += int(exc_nonzero.sum())
+            count_observed_nnz += int(any_nonzero.sum())
 
             for key, row_dict in zip(keys, df.to_dict("records")):
                 event_meta.setdefault(key, event_metadata_from_row(row_dict))
@@ -130,31 +152,37 @@ def index_chunk(task: Tuple[int, List[dict], str]) -> Tuple[int, List[dict], Dic
             }
         )
 
-    return chunk_id, cell_rows, event_meta, psi_nnz, count_nnz
+    return chunk_id, cell_rows, event_meta, psi_nnz, inclusion_nnz, exclusion_nnz, count_observed_nnz
 
 
-def init_fill_worker(psi_dir: str, event_to_col: Dict[str, int]) -> None:
+def init_fill_worker(psi_dir: str, event_to_col: Dict[str, int], input_format: str) -> None:
     _FILL_CONTEXT["psi_dir"] = psi_dir
     _FILL_CONTEXT["event_to_col"] = event_to_col
+    _FILL_CONTEXT["input_format"] = input_format
 
 
-def fill_chunk(task: Tuple[int, List[dict], str]) -> Tuple[int, str, int, int]:
+def fill_chunk(task: Tuple[int, List[dict], str]) -> Tuple[int, str, int, int, int, int]:
     chunk_id, rows, tmp_dir = task
     psi_dir = _FILL_CONTEXT["psi_dir"]
     event_to_col = _FILL_CONTEXT["event_to_col"]
+    input_format = _FILL_CONTEXT["input_format"]
 
     data_rows = []
     data_cols = []
     data_vals = []
-    count_rows = []
-    count_cols = []
+    inclusion_rows = []
+    inclusion_cols = []
     inclusion_vals = []
+    exclusion_rows = []
+    exclusion_cols = []
     exclusion_vals = []
+    count_observed_rows = []
+    count_observed_cols = []
 
     for row in rows:
         cell_row_idx = int(row["cell_index"])
         safe_cell_id = str(row["safe_cell_id"])
-        psi_file = os.path.join(psi_dir, f"{safe_cell_id}.csv")
+        psi_file = find_psi_file(psi_dir, safe_cell_id, input_format)
         if not os.path.exists(psi_file):
             continue
 
@@ -168,21 +196,40 @@ def fill_chunk(task: Tuple[int, List[dict], str]) -> Tuple[int, str, int, int]:
             data_cols.append(col_idx[psi_mask])
             data_vals.append(df.loc[psi_mask, "psi"].to_numpy(dtype=np.float32))
 
-        count_mask = (df["inclusion_count"].notna() & df["exclusion_count"].notna()).to_numpy()
-        n_count = int(count_mask.sum())
-        if n_count:
-            count_rows.append(np.full(n_count, cell_row_idx, dtype=np.int32))
-            count_cols.append(col_idx[count_mask])
-            inclusion_vals.append(df.loc[count_mask, "inclusion_count"].to_numpy(dtype=np.float32))
-            exclusion_vals.append(df.loc[count_mask, "exclusion_count"].to_numpy(dtype=np.float32))
+        count_mask = df["inclusion_count"].notna() & df["exclusion_count"].notna()
+        inc_nonzero = (count_mask & (df["inclusion_count"] > 0)).to_numpy()
+        exc_nonzero = (count_mask & (df["exclusion_count"] > 0)).to_numpy()
+        any_nonzero = inc_nonzero | exc_nonzero
+        n_inc = int(inc_nonzero.sum())
+        if n_inc:
+            inclusion_rows.append(np.full(n_inc, cell_row_idx, dtype=np.int32))
+            inclusion_cols.append(col_idx[inc_nonzero])
+            inclusion_vals.append(df.loc[inc_nonzero, "inclusion_count"].to_numpy(dtype=np.float32))
+        n_exc = int(exc_nonzero.sum())
+        if n_exc:
+            exclusion_rows.append(np.full(n_exc, cell_row_idx, dtype=np.int32))
+            exclusion_cols.append(col_idx[exc_nonzero])
+            exclusion_vals.append(df.loc[exc_nonzero, "exclusion_count"].to_numpy(dtype=np.float32))
+        n_obs = int(any_nonzero.sum())
+        if n_obs:
+            count_observed_rows.append(np.full(n_obs, cell_row_idx, dtype=np.int32))
+            count_observed_cols.append(col_idx[any_nonzero])
 
     data_rows_arr = np.concatenate(data_rows) if data_rows else np.empty(0, dtype=np.int32)
     data_cols_arr = np.concatenate(data_cols) if data_cols else np.empty(0, dtype=np.int32)
     data_vals_arr = np.concatenate(data_vals) if data_vals else np.empty(0, dtype=np.float32)
-    count_rows_arr = np.concatenate(count_rows) if count_rows else np.empty(0, dtype=np.int32)
-    count_cols_arr = np.concatenate(count_cols) if count_cols else np.empty(0, dtype=np.int32)
+    inclusion_rows_arr = np.concatenate(inclusion_rows) if inclusion_rows else np.empty(0, dtype=np.int32)
+    inclusion_cols_arr = np.concatenate(inclusion_cols) if inclusion_cols else np.empty(0, dtype=np.int32)
     inclusion_vals_arr = np.concatenate(inclusion_vals) if inclusion_vals else np.empty(0, dtype=np.float32)
+    exclusion_rows_arr = np.concatenate(exclusion_rows) if exclusion_rows else np.empty(0, dtype=np.int32)
+    exclusion_cols_arr = np.concatenate(exclusion_cols) if exclusion_cols else np.empty(0, dtype=np.int32)
     exclusion_vals_arr = np.concatenate(exclusion_vals) if exclusion_vals else np.empty(0, dtype=np.float32)
+    count_observed_rows_arr = (
+        np.concatenate(count_observed_rows) if count_observed_rows else np.empty(0, dtype=np.int32)
+    )
+    count_observed_cols_arr = (
+        np.concatenate(count_observed_cols) if count_observed_cols else np.empty(0, dtype=np.int32)
+    )
 
     out_path = os.path.join(tmp_dir, f"chunk_{chunk_id:06d}.npz")
     np.savez(
@@ -190,12 +237,23 @@ def fill_chunk(task: Tuple[int, List[dict], str]) -> Tuple[int, str, int, int]:
         data_rows=data_rows_arr,
         data_cols=data_cols_arr,
         data_vals=data_vals_arr,
-        count_rows=count_rows_arr,
-        count_cols=count_cols_arr,
+        inclusion_rows=inclusion_rows_arr,
+        inclusion_cols=inclusion_cols_arr,
         inclusion_vals=inclusion_vals_arr,
+        exclusion_rows=exclusion_rows_arr,
+        exclusion_cols=exclusion_cols_arr,
         exclusion_vals=exclusion_vals_arr,
+        count_observed_rows=count_observed_rows_arr,
+        count_observed_cols=count_observed_cols_arr,
     )
-    return chunk_id, out_path, len(data_vals_arr), len(inclusion_vals_arr)
+    return (
+        chunk_id,
+        out_path,
+        len(data_vals_arr),
+        len(inclusion_vals_arr),
+        len(exclusion_vals_arr),
+        len(count_observed_rows_arr),
+    )
 
 
 def build_matrix(
@@ -207,6 +265,7 @@ def build_matrix(
     output_dir: str = None,
     workers: int = 1,
     chunk_size: int = 25,
+    input_format: str = "auto",
 ) -> None:
     manifest = load_manifest(main_dir, manifest_path)
     completed = load_completed(main_dir)
@@ -223,21 +282,36 @@ def build_matrix(
     event_meta: Dict[str, dict] = {}
     cell_rows: List[dict] = []
     psi_nnz = 0
-    count_nnz = 0
+    inclusion_nnz = 0
+    exclusion_nnz = 0
+    count_observed_nnz = 0
     manifest_records = []
     for cell_row_idx, row in manifest.iterrows():
         row_dict = row.to_dict()
         row_dict["cell_index"] = cell_row_idx
         manifest_records.append(row_dict)
 
-    index_tasks = [(chunk_id, rows, psi_dir) for chunk_id, rows in enumerate(chunked(manifest_records, chunk_size))]
+    index_tasks = [
+        (chunk_id, rows, psi_dir, input_format)
+        for chunk_id, rows in enumerate(chunked(manifest_records, chunk_size))
+    ]
     if workers > 1 and len(index_tasks) > 1:
         with mp.Pool(processes=workers) as pool:
             iterator = pool.imap_unordered(index_chunk, index_tasks)
-            for chunks_done, (_, chunk_cell_rows, chunk_event_meta, chunk_psi_nnz, chunk_count_nnz) in enumerate(iterator, 1):
+            for chunks_done, (
+                _,
+                chunk_cell_rows,
+                chunk_event_meta,
+                chunk_psi_nnz,
+                chunk_inclusion_nnz,
+                chunk_exclusion_nnz,
+                chunk_count_observed_nnz,
+            ) in enumerate(iterator, 1):
                 cell_rows.extend(chunk_cell_rows)
                 psi_nnz += chunk_psi_nnz
-                count_nnz += chunk_count_nnz
+                inclusion_nnz += chunk_inclusion_nnz
+                exclusion_nnz += chunk_exclusion_nnz
+                count_observed_nnz += chunk_count_observed_nnz
                 for key, metadata in chunk_event_meta.items():
                     if key not in event_to_col:
                         event_to_col[key] = len(event_to_col)
@@ -245,15 +319,26 @@ def build_matrix(
                 if chunks_done % max(1, 1000 // chunk_size) == 0:
                     print(
                         f"Indexed ~{chunks_done * chunk_size} cells; "
-                        f"{len(event_to_col)} events; {psi_nnz} PSI entries; {count_nnz} count entries",
+                        f"{len(event_to_col)} events; {psi_nnz} PSI entries; "
+                        f"{inclusion_nnz} inclusion entries; {exclusion_nnz} exclusion entries",
                         flush=True,
                     )
     else:
         for chunks_done, task in enumerate(index_tasks, 1):
-            _, chunk_cell_rows, chunk_event_meta, chunk_psi_nnz, chunk_count_nnz = index_chunk(task)
+            (
+                _,
+                chunk_cell_rows,
+                chunk_event_meta,
+                chunk_psi_nnz,
+                chunk_inclusion_nnz,
+                chunk_exclusion_nnz,
+                chunk_count_observed_nnz,
+            ) = index_chunk(task)
             cell_rows.extend(chunk_cell_rows)
             psi_nnz += chunk_psi_nnz
-            count_nnz += chunk_count_nnz
+            inclusion_nnz += chunk_inclusion_nnz
+            exclusion_nnz += chunk_exclusion_nnz
+            count_observed_nnz += chunk_count_observed_nnz
             for key, metadata in chunk_event_meta.items():
                 if key not in event_to_col:
                     event_to_col[key] = len(event_to_col)
@@ -261,7 +346,8 @@ def build_matrix(
             if chunks_done % max(1, 1000 // chunk_size) == 0:
                 print(
                     f"Indexed ~{chunks_done * chunk_size} cells; "
-                    f"{len(event_to_col)} events; {psi_nnz} PSI entries; {count_nnz} count entries",
+                    f"{len(event_to_col)} events; {psi_nnz} PSI entries; "
+                    f"{inclusion_nnz} inclusion entries; {exclusion_nnz} exclusion entries",
                     flush=True,
                 )
 
@@ -273,20 +359,37 @@ def build_matrix(
     data_rows = np.empty(psi_nnz, dtype=np.int32)
     data_cols = np.empty(psi_nnz, dtype=np.int32)
     data_vals = np.empty(psi_nnz, dtype=np.float32)
-    count_rows = np.empty(count_nnz, dtype=np.int32)
-    count_cols = np.empty(count_nnz, dtype=np.int32)
-    inclusion_vals = np.empty(count_nnz, dtype=np.float32)
-    exclusion_vals = np.empty(count_nnz, dtype=np.float32)
+    inclusion_rows = np.empty(inclusion_nnz, dtype=np.int32)
+    inclusion_cols = np.empty(inclusion_nnz, dtype=np.int32)
+    inclusion_vals = np.empty(inclusion_nnz, dtype=np.float32)
+    exclusion_rows = np.empty(exclusion_nnz, dtype=np.int32)
+    exclusion_cols = np.empty(exclusion_nnz, dtype=np.int32)
+    exclusion_vals = np.empty(exclusion_nnz, dtype=np.float32)
+    count_observed_rows = np.empty(count_observed_nnz, dtype=np.int32)
+    count_observed_cols = np.empty(count_observed_nnz, dtype=np.int32)
 
     psi_pos = 0
-    count_pos = 0
+    inclusion_pos = 0
+    exclusion_pos = 0
+    count_observed_pos = 0
     fill_tasks = [(chunk_id, rows, "") for chunk_id, rows in enumerate(chunked(manifest_records, chunk_size))]
     with tempfile.TemporaryDirectory(prefix="sparse_chunks_", dir=output_dir) as tmp_dir:
         fill_tasks = [(chunk_id, rows, tmp_dir) for chunk_id, rows, _ in fill_tasks]
         if workers > 1 and len(fill_tasks) > 1:
-            with mp.Pool(processes=workers, initializer=init_fill_worker, initargs=(psi_dir, event_to_col)) as pool:
+            with mp.Pool(
+                processes=workers,
+                initializer=init_fill_worker,
+                initargs=(psi_dir, event_to_col, input_format),
+            ) as pool:
                 iterator = pool.imap_unordered(fill_chunk, fill_tasks)
-                for chunks_done, (_, chunk_path, chunk_psi_nnz, chunk_count_nnz) in enumerate(iterator, 1):
+                for chunks_done, (
+                    _,
+                    chunk_path,
+                    chunk_psi_nnz,
+                    chunk_inclusion_nnz,
+                    chunk_exclusion_nnz,
+                    chunk_count_observed_nnz,
+                ) in enumerate(iterator, 1):
                     with np.load(chunk_path) as chunk:
                         psi_slice = slice(psi_pos, psi_pos + chunk_psi_nnz)
                         data_rows[psi_slice] = chunk["data_rows"]
@@ -294,23 +397,45 @@ def build_matrix(
                         data_vals[psi_slice] = chunk["data_vals"]
                         psi_pos += chunk_psi_nnz
 
-                        count_slice = slice(count_pos, count_pos + chunk_count_nnz)
-                        count_rows[count_slice] = chunk["count_rows"]
-                        count_cols[count_slice] = chunk["count_cols"]
-                        inclusion_vals[count_slice] = chunk["inclusion_vals"]
-                        exclusion_vals[count_slice] = chunk["exclusion_vals"]
-                        count_pos += chunk_count_nnz
+                        inclusion_slice = slice(inclusion_pos, inclusion_pos + chunk_inclusion_nnz)
+                        inclusion_rows[inclusion_slice] = chunk["inclusion_rows"]
+                        inclusion_cols[inclusion_slice] = chunk["inclusion_cols"]
+                        inclusion_vals[inclusion_slice] = chunk["inclusion_vals"]
+                        inclusion_pos += chunk_inclusion_nnz
+
+                        exclusion_slice = slice(exclusion_pos, exclusion_pos + chunk_exclusion_nnz)
+                        exclusion_rows[exclusion_slice] = chunk["exclusion_rows"]
+                        exclusion_cols[exclusion_slice] = chunk["exclusion_cols"]
+                        exclusion_vals[exclusion_slice] = chunk["exclusion_vals"]
+                        exclusion_pos += chunk_exclusion_nnz
+
+                        observed_slice = slice(
+                            count_observed_pos,
+                            count_observed_pos + chunk_count_observed_nnz,
+                        )
+                        count_observed_rows[observed_slice] = chunk["count_observed_rows"]
+                        count_observed_cols[observed_slice] = chunk["count_observed_cols"]
+                        count_observed_pos += chunk_count_observed_nnz
                     os.remove(chunk_path)
                     if chunks_done % max(1, 1000 // chunk_size) == 0:
                         print(
                             f"Filled ~{chunks_done * chunk_size} cells; "
-                            f"{psi_pos}/{psi_nnz} PSI entries; {count_pos}/{count_nnz} count entries",
+                            f"{psi_pos}/{psi_nnz} PSI entries; "
+                            f"{inclusion_pos}/{inclusion_nnz} inclusion entries; "
+                            f"{exclusion_pos}/{exclusion_nnz} exclusion entries",
                             flush=True,
                         )
         else:
-            init_fill_worker(psi_dir, event_to_col)
+            init_fill_worker(psi_dir, event_to_col, input_format)
             for chunks_done, task in enumerate(fill_tasks, 1):
-                _, chunk_path, chunk_psi_nnz, chunk_count_nnz = fill_chunk(task)
+                (
+                    _,
+                    chunk_path,
+                    chunk_psi_nnz,
+                    chunk_inclusion_nnz,
+                    chunk_exclusion_nnz,
+                    chunk_count_observed_nnz,
+                ) = fill_chunk(task)
                 with np.load(chunk_path) as chunk:
                     psi_slice = slice(psi_pos, psi_pos + chunk_psi_nnz)
                     data_rows[psi_slice] = chunk["data_rows"]
@@ -318,23 +443,44 @@ def build_matrix(
                     data_vals[psi_slice] = chunk["data_vals"]
                     psi_pos += chunk_psi_nnz
 
-                    count_slice = slice(count_pos, count_pos + chunk_count_nnz)
-                    count_rows[count_slice] = chunk["count_rows"]
-                    count_cols[count_slice] = chunk["count_cols"]
-                    inclusion_vals[count_slice] = chunk["inclusion_vals"]
-                    exclusion_vals[count_slice] = chunk["exclusion_vals"]
-                    count_pos += chunk_count_nnz
+                    inclusion_slice = slice(inclusion_pos, inclusion_pos + chunk_inclusion_nnz)
+                    inclusion_rows[inclusion_slice] = chunk["inclusion_rows"]
+                    inclusion_cols[inclusion_slice] = chunk["inclusion_cols"]
+                    inclusion_vals[inclusion_slice] = chunk["inclusion_vals"]
+                    inclusion_pos += chunk_inclusion_nnz
+
+                    exclusion_slice = slice(exclusion_pos, exclusion_pos + chunk_exclusion_nnz)
+                    exclusion_rows[exclusion_slice] = chunk["exclusion_rows"]
+                    exclusion_cols[exclusion_slice] = chunk["exclusion_cols"]
+                    exclusion_vals[exclusion_slice] = chunk["exclusion_vals"]
+                    exclusion_pos += chunk_exclusion_nnz
+
+                    observed_slice = slice(count_observed_pos, count_observed_pos + chunk_count_observed_nnz)
+                    count_observed_rows[observed_slice] = chunk["count_observed_rows"]
+                    count_observed_cols[observed_slice] = chunk["count_observed_cols"]
+                    count_observed_pos += chunk_count_observed_nnz
                 os.remove(chunk_path)
                 if chunks_done % max(1, 1000 // chunk_size) == 0:
                     print(
                         f"Filled ~{chunks_done * chunk_size} cells; "
-                        f"{psi_pos}/{psi_nnz} PSI entries; {count_pos}/{count_nnz} count entries",
+                        f"{psi_pos}/{psi_nnz} PSI entries; "
+                        f"{inclusion_pos}/{inclusion_nnz} inclusion entries; "
+                        f"{exclusion_pos}/{exclusion_nnz} exclusion entries",
                         flush=True,
                     )
 
-    if psi_pos != psi_nnz or count_pos != count_nnz:
+    if (
+        psi_pos != psi_nnz
+        or inclusion_pos != inclusion_nnz
+        or exclusion_pos != exclusion_nnz
+        or count_observed_pos != count_observed_nnz
+    ):
         raise RuntimeError(
-            f"Sparse entry count mismatch: psi {psi_pos}/{psi_nnz}, count {count_pos}/{count_nnz}"
+            "Sparse entry count mismatch: "
+            f"psi {psi_pos}/{psi_nnz}, "
+            f"inclusion {inclusion_pos}/{inclusion_nnz}, "
+            f"exclusion {exclusion_pos}/{exclusion_nnz}, "
+            f"count_observed {count_observed_pos}/{count_observed_nnz}"
         )
 
     psi_matrix = sparse.coo_matrix(
@@ -348,21 +494,21 @@ def build_matrix(
     inclusion_count_matrix = sparse.coo_matrix(
         (
             inclusion_vals,
-            (count_rows, count_cols),
+            (inclusion_rows, inclusion_cols),
         ),
         shape=(n_cells, n_events),
     ).tocsr()
     exclusion_count_matrix = sparse.coo_matrix(
         (
             exclusion_vals,
-            (count_rows, count_cols),
+            (exclusion_rows, exclusion_cols),
         ),
         shape=(n_cells, n_events),
     ).tocsr()
     count_observed_matrix = sparse.coo_matrix(
         (
-            np.ones(count_nnz, dtype=np.int8),
-            (count_rows, count_cols),
+            np.ones(count_observed_nnz, dtype=np.int8),
+            (count_observed_rows, count_observed_cols),
         ),
         shape=(n_cells, n_events),
     ).tocsr()
@@ -407,6 +553,8 @@ def build_matrix(
                 "inclusion_count_matrix": "cell_event_inclusion_count.npz",
                 "exclusion_count_matrix": "cell_event_exclusion_count.npz",
                 "count_observed_matrix": "cell_event_count_observed.npz",
+                "count_observed_semantics": "cell-event pairs with at least one positive inclusion or exclusion count",
+                "stored_count_semantics": "inclusion_count and exclusion_count matrices store positive counts only; absent entries are zero",
                 "anndata": "cell_event_counts.h5ad" if write_h5ad else None,
             },
             handle,
@@ -427,6 +575,7 @@ def main():
     parser.add_argument("--output-dir", help="Directory for final sparse matrix outputs")
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel CSV reader workers")
     parser.add_argument("--chunk-size", type=int, default=25, help="Cells per parallel collation chunk")
+    parser.add_argument("--input-format", choices=["auto", "csv", "parquet"], default="auto", help="Per-cell table format")
     args = parser.parse_args()
     build_matrix(
         args.main_dir,
@@ -437,6 +586,7 @@ def main():
         args.output_dir,
         args.workers,
         args.chunk_size,
+        args.input_format,
     )
 
 
