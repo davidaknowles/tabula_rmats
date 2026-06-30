@@ -7,6 +7,7 @@ import os
 import tempfile
 from typing import Dict, List, Tuple
 
+import pandas.errors
 import numpy as np
 import pandas as pd
 from scipy import sparse
@@ -23,7 +24,12 @@ def event_key(row: pd.Series) -> str:
 
 
 def prepare_event_df(psi_file: str) -> Tuple[pd.DataFrame, pd.Series]:
-    df = pd.read_csv(psi_file)
+    if not os.path.exists(psi_file) or os.path.getsize(psi_file) == 0:
+        raise ValueError(f"Missing or empty PSI CSV: {psi_file}")
+    try:
+        df = pd.read_csv(psi_file)
+    except pandas.errors.EmptyDataError as exc:
+        raise ValueError(f"Empty PSI CSV: {psi_file}") from exc
     required_cols = {"event_id", "psi", "inclusion_count", "exclusion_count"}
     missing_cols = required_cols.difference(df.columns)
     if missing_cols:

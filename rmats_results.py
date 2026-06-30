@@ -220,7 +220,7 @@ def process_sample(
 
     os.makedirs(psi_dir, exist_ok=True)
     csv_name = os.path.join(psi_dir, f"{sample_name}.csv")
-    if skip_existing and os.path.exists(csv_name):
+    if skip_existing and os.path.exists(csv_name) and os.path.getsize(csv_name) > 0:
         print(f"\t↪️ Skipping existing {csv_name}")
         return 0
 
@@ -230,7 +230,9 @@ def process_sample(
         tables.append(extract_psi_table(rmats_df, sample_label, event_type))
 
     out_df = pd.concat(tables, ignore_index=True)
-    out_df.to_csv(csv_name, index=False)
+    tmp_name = f"{csv_name}.tmp.{os.getpid()}"
+    out_df.to_csv(tmp_name, index=False)
+    os.replace(tmp_name, csv_name)
     if os.path.exists(csv_name):
         print(f"\t✅ Successfully saved {csv_name} ({len(out_df):,} events)")
         return 0
